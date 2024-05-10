@@ -7,14 +7,16 @@ Foundation, either version 3 of the License, or (at your option) any later versi
 
 Endless Sky is distributed in the hope that it will be useful, but WITHOUT ANY
 WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
 #include "GameEvent.h"
 
 #include "DataWriter.h"
 #include "GameData.h"
-#include "Government.h"
 #include "Planet.h"
 #include "PlayerInfo.h"
 #include "System.h"
@@ -34,6 +36,7 @@ namespace {
 		"shipyard",
 		"system",
 		"substitutions",
+		"wormhole",
 	};
 }
 
@@ -43,7 +46,7 @@ namespace {
 map<string, set<string>> GameEvent::DeferredDefinitions(const list<DataNode> &changes)
 {
 	auto definitions = map<string, set<string>> {};
-	
+
 	for(auto &&node : changes)
 		if(node.Size() >= 2 && node.HasChildren() && DEFINITION_NODES.count(node.Token(0)))
 		{
@@ -59,12 +62,12 @@ map<string, set<string>> GameEvent::DeferredDefinitions(const list<DataNode> &ch
 					definitions[key].emplace(name);
 			}
 			// Since this (or any other) event may be used to assign a planet to a system, we cannot
-			// do a robust "planet definition" check. Similarly, all other GameEvent-createable objects
+			// do a robust "planet definition" check. Similarly, all other GameEvent-creatable objects
 			// become valid once they appear as a root-level node that has at least one child node.
 			else
 				definitions[key].emplace(name);
 		}
-	
+
 	return definitions;
 }
 
@@ -88,7 +91,7 @@ void GameEvent::Load(const DataNode &node)
 		conditionsToApply.Add("set", "event: " + name);
 	}
 	isDefined = true;
-	
+
 	static const auto allowedChanges = []() -> set<string>
 		{
 			auto allowed = DEFINITION_NODES;
@@ -99,7 +102,7 @@ void GameEvent::Load(const DataNode &node)
 			});
 			return allowed;
 		}();
-	
+
 	for(const DataNode &child : node)
 	{
 		const string &key = child.Token(0);
@@ -124,27 +127,39 @@ void GameEvent::Load(const DataNode &node)
 
 void GameEvent::Save(DataWriter &out) const
 {
+	if(isDisabled)
+		return;
+
 	out.Write("event");
 	out.BeginChild();
 	{
 		if(date)
 			out.Write("date", date.Day(), date.Month(), date.Year());
 		conditionsToApply.Save(out);
-		
+
 		for(auto &&system : systemsToUnvisit)
 			out.Write("unvisit", system->Name());
 		for(auto &&planet : planetsToUnvisit)
 			out.Write("unvisit planet", planet->TrueName());
-		
+
 		for(auto &&system : systemsToVisit)
 			out.Write("visit", system->Name());
 		for(auto &&planet : planetsToVisit)
 			out.Write("visit planet", planet->TrueName());
-		
+
 		for(auto &&change : changes)
 			out.Write(change);
 	}
 	out.EndChild();
+}
+
+
+
+// Prevent this GameEvent from being applied or written into a player's save.
+// (Events read from a save are not associated with the managed Set of GameData::Events.)
+void GameEvent::Disable()
+{
+	isDisabled = true;
 }
 
 
@@ -174,23 +189,24 @@ const Date &GameEvent::GetDate() const
 
 // Check that this GameEvent has been loaded from a file (vs. referred to only
 // by name), and that the systems & planets it references are similarly defined.
-bool GameEvent::IsValid() const
+// Returns an empty string if it is valid. If not, a reason will be given in the string.
+string GameEvent::IsValid() const
 {
 	// When Apply is called, we mutate the universe definition before we update
 	// the player's knowledge of the universe. Thus, to determine if a system or
 	// planet is invalid, we must first peek at what `changes` will do.
 	auto deferred = DeferredDefinitions(changes);
-	
+
 	for(auto &&systems : {systemsToVisit, systemsToUnvisit})
 		for(auto &&system : systems)
 			if(!system->IsValid() && !deferred["system"].count(system->Name()))
-				return false;
+				return "contains invalid system \"" + system->Name() + "\".";
 	for(auto &&planets : {planetsToVisit, planetsToUnvisit})
 		for(auto &&planet : planets)
 			if(!planet->IsValid() && !deferred["planet"].count(planet->TrueName()))
-				return false;
-	
-	return isDefined;
+				return "contains invalid planet \"" + planet->TrueName() + "\".";
+
+	return isDefined ? "" : "not defined";
 }
 
 
@@ -202,32 +218,31 @@ void GameEvent::SetDate(const Date &date)
 
 
 
-void GameEvent::Apply(PlayerInfo &player)
+// Apply this event's changes to the player. Returns a list of data changes that need to
+// be applied in a batch with other events that are applied at the same time.
+list<DataNode> GameEvent::Apply(PlayerInfo &player)
 {
-	// Serialize the current reputation with other governments.
-	player.SetReputationConditions();
-	
+	if(isDisabled)
+		return {};
+
 	// Apply this event's ConditionSet to the player's conditions.
 	conditionsToApply.Apply(player.Conditions());
-	// Apply (and store a record of applying) this event's other general
-	// changes (e.g. updating an outfitter's inventory).
-	player.AddChanges(changes);
-	
-	// Update the current reputation with other governments (e.g. this
-	// event's ConditionSet may have altered some reputations).
-	player.CheckReputationConditions();
-	
+
 	for(const System *system : systemsToUnvisit)
 		player.Unvisit(*system);
 	for(const Planet *planet : planetsToUnvisit)
 		player.Unvisit(*planet);
-	
+
 	// Perform visits after unvisits, as "unvisit <system>"
 	// will unvisit any planets in that system.
 	for(const System *system : systemsToVisit)
 		player.Visit(*system);
 	for(const Planet *planet : planetsToVisit)
 		player.Visit(*planet);
+
+	// Return this event's data changes so that they can be batch applied
+	// with the changes from other events.
+	return std::move(changes);
 }
 
 
